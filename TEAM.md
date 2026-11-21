@@ -2,4 +2,7 @@
 
 Name:
 Members:
-Engine: Rust (hand-written, rayon + parquet crate)
+- Athithyan Senthilkumar
+- Narayanan Venkata Krishnan
+
+Engine: Rust (hand-written)

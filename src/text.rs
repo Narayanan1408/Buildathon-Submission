@@ -208,7 +208,12 @@ pub fn body(d: Bytes) -> Bytes {
 
 /// Split every file body into pieces of about CHUNK bytes, cut at line ends.
 pub fn chunks(files: &[PathBuf]) -> Vec<Bytes> {
-    let bodies: Vec<Bytes> = files.iter().map(|p| body(map_file(p))).collect();
+    // read, not mapped: one large read per file is faster than a page fault
+    // per page when the file is not in the page cache yet
+    let bodies: Vec<Bytes> = files
+        .iter()
+        .map(|p| body(Box::leak(fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())).into_boxed_slice())))
+        .collect();
     let mut out = Vec::new();
     for b in bodies {
         let mut s = 0;
