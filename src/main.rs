@@ -409,8 +409,8 @@ fn main() {
             |_| Parsed { evu: new_lists(), dd: new_lists(), buf: Vec::new() },
             |out, ci| {
                 let mut buf = std::mem::take(&mut out.buf);
-                let n = ev_pieces.read(ci, &mut buf);
-                parse_events(&buf[..n], buf.as_ptr_range().end, out, &win, &prod, unknown, &rh, &seg_pool);
+                let r = ev_pieces.read(ci, &mut buf);
+                parse_events(&buf[r], buf.as_ptr_range().end, out, &win, &prod, unknown, &rh, &seg_pool);
                 out.buf = buf;
             },
         );
@@ -441,9 +441,9 @@ fn main() {
             // dedup first: the clicks then go into the recycled dedup notes
             if item >= NB {
                 let mut buf = std::mem::take(&mut r.buf);
-                let n = ck_pieces.read(item - NB, &mut buf);
+                let range = ck_pieces.read(item - NB, &mut buf);
                 let end = buf.as_ptr_range().end;
-                let chunk = &buf[..n];
+                let chunk = &buf[range];
                 let mut dc = DateCache::new();
                 scan::<4>(chunk, |[cid, user, camp, ts]| {
                     if cid.is_empty() || user.is_empty() {

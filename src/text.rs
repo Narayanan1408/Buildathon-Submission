@@ -112,70 +112,89 @@ pub fn csv_files(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// A piece of a CSV file (whole lines, header excluded), read on demand.
+/// A byte range of a CSV file; it owns the lines that start inside it.
 pub struct Piece {
     file: usize,
     off: u64,
-    len: usize,
+    end: u64,
 }
 
-/// The pieces of a set of CSV files, about CHUNK bytes each, cut after a newline.
-/// Workers read pieces into their own reused buffer with `read`, so the
-/// files are never mapped into memory.
+/// The pieces of a set of CSV files, `chunk` bytes each. Planning reads
+/// nothing (no serial I/O before the workers start): each worker finds its
+/// own line boundaries when it reads a piece. Workers read pieces into their
+/// own reused buffer with `read`, so the files are never mapped into memory.
 pub struct Pieces {
-    files: Vec<File>,
+    files: Vec<(File, u64)>,
     pub pieces: Vec<Piece>,
-}
-
-/// Position just after the first newline at or after `from`, or the file end.
-fn after_newline(f: &File, from: u64, len: u64) -> u64 {
-    use std::os::unix::fs::FileExt;
-    let mut buf = [0u8; 4096];
-    let mut at = from;
-    while at < len {
-        let n = ((len - at) as usize).min(buf.len());
-        f.read_exact_at(&mut buf[..n], at).expect("read");
-        if let Some(i) = memchr::memchr(b'\n', &buf[..n]) {
-            return at + i as u64 + 1;
-        }
-        at += n as u64;
-    }
-    len
 }
 
 impl Pieces {
     pub fn plan(paths: &[PathBuf]) -> Pieces {
+        Self::plan_with(paths, CHUNK as u64)
+    }
+
+    pub fn plan_with(paths: &[PathBuf], chunk: u64) -> Pieces {
         let mut files = Vec::new();
         let mut pieces = Vec::new();
         for p in paths {
             let f = File::open(p).unwrap_or_else(|e| panic!("open {}: {e}", p.display()));
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             let fi = files.len();
-            let mut at = after_newline(&f, 0, len); // skip the header
+            let mut at = 0;
             while at < len {
-                let mut end = (at + CHUNK as u64).min(len);
-                if end < len {
-                    end = after_newline(&f, end, len);
-                }
-                pieces.push(Piece { file: fi, off: at, len: (end - at) as usize });
+                let end = (at + chunk).min(len);
+                pieces.push(Piece { file: fi, off: at, end });
                 at = end;
             }
-            files.push(f);
+            files.push((f, len));
         }
         Pieces { files, pieces }
     }
 
-    /// Read piece `i` into the start of `buf` and return its length. `buf`
-    /// keeps at least 64 bytes after the piece, so 16-byte loads near its end
-    /// stay inside the buffer.
-    pub fn read(&self, i: usize, buf: &mut Vec<u8>) -> usize {
+    /// Read piece `i` into `buf` and return the range of `buf` holding its
+    /// lines: every line that starts at a position p with off <= p < end,
+    /// where a line starts at 0 or after a newline. The file's first line
+    /// (the header) is never included. `buf` keeps at least 64 bytes after
+    /// the range, so 16-byte loads near its end stay inside the buffer.
+    pub fn read(&self, i: usize, buf: &mut Vec<u8>) -> std::ops::Range<usize> {
         use std::os::unix::fs::FileExt;
         let p = &self.pieces[i];
-        if buf.len() < p.len + 64 {
-            buf.resize(p.len.max(CHUNK + 4096) + 64, 0);
+        let (f, len) = &self.files[p.file];
+        let len = *len;
+        // one byte before the piece tells whether a line starts at `off`
+        let from = p.off.saturating_sub(1);
+        let mut n = (p.end - from) as usize;
+        if buf.len() < n + 64 {
+            buf.resize(n.max(CHUNK + 4096) + 64, 0);
         }
-        self.files[p.file].read_exact_at(&mut buf[..p.len], p.off).expect("read piece");
-        p.len
+        f.read_exact_at(&mut buf[..n], from).expect("read piece");
+        // the first line starts after the first newline at or after off - 1
+        // (for the first piece: after the header)
+        let start = match memchr::memchr(b'\n', &buf[..n]) {
+            Some(j) => j + 1,
+            None => return 0..0,
+        };
+        if start as u64 + from >= p.end {
+            return 0..0; // no line starts inside this piece
+        }
+        // the last line ends at the first newline at or after end - 1
+        let mut scanned = (p.end - 1 - from) as usize;
+        loop {
+            if let Some(j) = memchr::memchr(b'\n', &buf[scanned..n]) {
+                return start..scanned + j + 1;
+            }
+            scanned = n;
+            let at = from + n as u64;
+            if at >= len {
+                return start..n; // last line without a newline
+            }
+            let more = ((len - at) as usize).min(64 << 10);
+            if buf.len() < n + more + 64 {
+                buf.resize(n + more + 64, 0);
+            }
+            f.read_exact_at(&mut buf[n..n + more], at).expect("read piece");
+            n += more;
+        }
     }
 }
 
@@ -796,6 +815,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Pieces of any size hand out every line after the header exactly once.
+    #[test]
+    fn pieces_cover_every_line_once() {
+        let dir = std::env::temp_dir().join(format!("pieces-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rng = Rng(0x5eed_0f_7e57_0001);
+        let mut paths = Vec::new();
+        let mut want = Vec::new();
+        for f in 0..12 {
+            let mut v: Vec<u8> = Vec::new();
+            let kind = f % 4;
+            if kind != 0 {
+                v.extend_from_slice(b"h1,h2\n");
+            }
+            if kind == 0 && f > 0 {
+                v.extend_from_slice(b"only,header"); // no newline at all
+            }
+            let lines = if kind == 1 { 0 } else { rng.next() % 300 };
+            for i in 0..lines {
+                let w = (rng.next() % 40) as usize;
+                let line: Vec<u8> = (0..w).map(|_| rng.pick(b"ab,\"\r xyz")).collect();
+                v.extend_from_slice(&line);
+                if i + 1 < lines || rng.next() % 2 == 0 {
+                    v.push(b'\n');
+                }
+            }
+            want.extend_from_slice(body(Box::leak(v.clone().into_boxed_slice())));
+            if !want.is_empty() && *want.last().unwrap() != b'\n' {
+                want.push(b'\n');
+            }
+            let p = dir.join(format!("f{f:02}.csv"));
+            std::fs::write(&p, &v).unwrap();
+            paths.push(p);
+        }
+        for chunk in [1u64, 2, 3, 5, 8, 13, 64, 100, 1000, 100_000] {
+            let pieces = Pieces::plan_with(&paths, chunk);
+            let mut got = Vec::new();
+            let mut buf = Vec::new();
+            for i in 0..pieces.pieces.len() {
+                let r = pieces.read(i, &mut buf);
+                assert!(buf.len() >= r.end + 64);
+                got.extend_from_slice(&buf[r]);
+                if !got.is_empty() && *got.last().unwrap() != b'\n' {
+                    got.push(b'\n');
+                }
+            }
+            assert_eq!(String::from_utf8_lossy(&got), String::from_utf8_lossy(&want), "chunk {chunk}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn collect<const N: usize>(chunk: Bytes, fast: bool) -> Vec<Vec<Vec<u8>>> {
