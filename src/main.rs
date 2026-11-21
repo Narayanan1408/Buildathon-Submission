@@ -114,6 +114,11 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// Map from every linked ID to its person's name (the byte-wise smallest ID),
 /// split into NB maps by bucket(id).
 fn build_links(files: &[PathBuf]) -> Vec<Map<Key, Key>> {
+    link_names(&link_pairs(files))
+}
+
+/// The two IDs of every well-formed link line with both sides non-empty.
+fn link_pairs(files: &[PathBuf]) -> Vec<(Key, Key)> {
     let mut pairs: Vec<(Key, Key)> = Vec::new();
     for c in chunks(files) {
         for_lines(c, |l| {
@@ -124,31 +129,49 @@ fn build_links(files: &[PathBuf]) -> Vec<Map<Key, Key>> {
             }
         });
     }
-    let mut index: Map<Key, u32> = new_map(pairs.len() * 2);
+    pairs
+}
+
+/// Union-find over the pairs. IDs are first grouped by bucket(id) and
+/// numbered bucket by bucket, so every hash map involved is small and stays
+/// in cache (one map over all IDs would miss the cache on every lookup).
+fn link_names(pairs: &[(Key, Key)]) -> Vec<Map<Key, Key>> {
+    let rh = route_hasher();
+    // every side of every pair, with its slot (2 * pair + side), by bucket
+    let mut by_b: Vec<Vec<(Key, usize)>> = (0..NB).map(|_| Vec::with_capacity(pairs.len() * 2 / NB + 16)).collect();
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        by_b[bucket(&rh, a)].push((a, 2 * i));
+        by_b[bucket(&rh, b)].push((b, 2 * i + 1));
+    }
+    // number the distinct IDs, bucket by bucket
     let mut ids: Vec<Key> = Vec::with_capacity(pairs.len() * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
-    let mut size: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
-    for &(a, b) in &pairs {
-        let mut intern = |s: Key| -> u32 {
-            *index.entry(s).or_insert_with(|| {
-                let i = ids.len() as u32;
-                ids.push(s);
-                parent.push(i);
-                size.push(1);
-                i
-            })
-        };
-        let ia = intern(a);
-        let ib = intern(b);
-        let ra = find(&mut parent, ia);
-        let rb = find(&mut parent, ib);
+    let mut start = vec![0usize; NB + 1];
+    let mut slot = vec![0u32; pairs.len() * 2];
+    let mut local: Map<Key, u32> = new_map(0);
+    for (b, items) in by_b.iter().enumerate() {
+        start[b] = ids.len();
+        local.clear();
+        for &(k, s) in items {
+            slot[s] = *local.entry(k).or_insert_with(|| {
+                ids.push(k);
+                (ids.len() - 1) as u32
+            });
+        }
+    }
+    start[NB] = ids.len();
+    drop(by_b);
+    let n = ids.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    let mut size = vec![1u32; n];
+    for p in slot.chunks_exact(2) {
+        let ra = find(&mut parent, p[0]);
+        let rb = find(&mut parent, p[1]);
         if ra != rb {
             let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
             parent[small as usize] = big;
             size[big as usize] += size[small as usize];
         }
     }
-    let n = ids.len();
     let mut root_name: Vec<Key> = ids.clone();
     let mut roots = vec![0u32; n];
     for i in 0..n {
@@ -158,13 +181,16 @@ fn build_links(files: &[PathBuf]) -> Vec<Map<Key, Key>> {
             root_name[r as usize] = ids[i];
         }
     }
-    // split by bucket(id), so each user bucket only needs its own small map
-    let rh = route_hasher();
-    let mut out: Vec<Map<Key, Key>> = (0..NB).map(|_| new_map(n / NB + 8)).collect();
-    for i in 0..n {
-        out[bucket(&rh, ids[i])].insert(ids[i], root_name[roots[i] as usize]);
-    }
-    out
+    // the IDs of bucket b are ids[start[b]..start[b + 1]]
+    (0..NB)
+        .map(|b| {
+            let mut m = new_map(start[b + 1] - start[b]);
+            for i in start[b]..start[b + 1] {
+                m.insert(ids[i], root_name[roots[i] as usize]);
+            }
+            m
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------ records
@@ -370,7 +396,13 @@ fn main() {
     // ---- links (side thread) + events: parse; valid copies go to their user
     //      bucket, a dedup note for every copy goes to its event_id bucket.
     let (links, parsed) = std::thread::scope(|sc| {
-        let links = sc.spawn(|| build_links(&link_files));
+        let links = sc.spawn(|| {
+            let l = build_links(&link_files);
+            if timing {
+                eprintln!("{:>8.1} ms  (side thread) links built", t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            l
+        });
         let parsed: Vec<Parsed> = workers(
             threads,
             ev_pieces.pieces.len(),
@@ -861,3 +893,77 @@ fn person_bucket(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first, plain union-find: one map over all IDs.
+    fn link_names_ref(pairs: &[(Key, Key)]) -> std::collections::HashMap<Key, Key> {
+        let mut index: std::collections::HashMap<Key, u32> = Default::default();
+        let mut ids: Vec<Key> = Vec::new();
+        let mut parent: Vec<u32> = Vec::new();
+        for &(a, b) in pairs {
+            let mut intern = |s: Key| -> u32 {
+                *index.entry(s).or_insert_with(|| {
+                    ids.push(s);
+                    parent.push(ids.len() as u32 - 1);
+                    ids.len() as u32 - 1
+                })
+            };
+            let ia = intern(a);
+            let ib = intern(b);
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            parent[ra as usize] = rb;
+        }
+        let mut name: std::collections::HashMap<u32, Key> = Default::default();
+        for i in 0..ids.len() {
+            let r = find(&mut parent, i as u32);
+            let e = name.entry(r).or_insert(ids[i]);
+            if key_cmp(ids[i], *e) == Ordering::Less {
+                *e = ids[i];
+            }
+        }
+        (0..ids.len()).map(|i| (ids[i], name[&find(&mut parent, i as u32)])).collect()
+    }
+
+    #[test]
+    fn link_names_match_plain_union_find() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..20 {
+            let ids = 10 + (rnd() % 5000) as usize;
+            let npairs = (rnd() % (2 * ids as u64)) as usize;
+            let name = |i: u64| -> Key {
+                // some long IDs (hashed keys) and some upper-case ones
+                let s = match i % 7 {
+                    0 => format!("U{i}"),
+                    1 => format!("u{i}-a-rather-long-user-id"),
+                    _ => format!("u{i}"),
+                };
+                key(s.as_bytes())
+            };
+            let mut pairs = Vec::new();
+            for _ in 0..npairs {
+                let a = rnd() % ids as u64;
+                // mostly short chains, sometimes self links and repeats
+                let b = if rnd() % 10 == 0 { a } else { (a + 1 + rnd() % 3) % ids as u64 };
+                pairs.push((name(a), name(b)));
+            }
+            let got = link_names(&pairs);
+            let want = link_names_ref(&pairs);
+            let n: usize = got.iter().map(|m| m.len()).sum();
+            assert_eq!(n, want.len(), "round {round}");
+            let rh = route_hasher();
+            for (k, v) in &want {
+                assert_eq!(got[bucket(&rh, *k)].get(k), Some(v), "round {round}");
+            }
+        }
+    }
+}
